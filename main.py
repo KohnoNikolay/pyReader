@@ -8,6 +8,7 @@ import os
 SETTINGS_FILE = "reader_settings.json"
 current_font_size = 14  # Текущий размер шрифта
 
+
 def save_settings(file_path, scroll_position=0.0, font_size=14):
     """Сохраняет настройки: путь к файлу, позицию, размер шрифта"""
     settings = {
@@ -111,11 +112,126 @@ def save_current_settings():
     save_settings(file_path, scroll_pos, current_font_size)
 
 
+def find_text(event=None):
+    """Ищет все совпадения и подсвечивает их"""
+    # Убираем старую подсветку
+    text_area.tag_remove("highlight", "1.0", tk.END)
+    text_area.tag_remove("current", "1.0", tk.END)
+
+    # Получаем текст для поиска
+    query = search_entry.get()
+    if not query:
+        return
+
+    # Начинаем поиск с начала текста
+    start_pos = "1.0"
+    count = 0
+
+    while True:
+        # Ищем следующее совпадение
+        pos = text_area.search(query, start_pos, stopindex=tk.END, nocase=True)
+        if not pos:
+            break  # Совпадений больше нет
+
+        # Определяем конец совпадения
+        end_pos = f"{pos}+{len(query)}c"
+
+        # Подсвечиваем
+        text_area.tag_add("highlight", pos, end_pos)
+        count += 1
+
+        # Продолжаем поиск с конца текущего совпадения
+        start_pos = end_pos
+
+    # Если что-то нашли — переходим к первому совпадению
+    if count > 0:
+        first_pos = text_area.search(query, "1.0", stopindex=tk.END, nocase=True)
+        if first_pos:
+            end_pos = f"{first_pos}+{len(query)}c"
+            text_area.tag_remove("current", "1.0", tk.END)
+            text_area.tag_add("current", first_pos, end_pos)
+            text_area.see(first_pos)
+            text_area.mark_set("found_pos", first_pos)
+
+        # Показываем количество найденных совпадений
+        window.title(f"Моя читалка - Найдено: {count}")
+    else:
+        window.title("Моя читалка - Ничего не найдено")
+
+
+def find_next(event=None):
+    """Переходит к следующему совпадению"""
+    query = search_entry.get()
+    if not query:
+        return
+
+    # Получаем позицию последнего найденного совпадения
+    if not text_area.mark_names() or "found_pos" not in text_area.mark_names():
+        # Если поиск не запускался — запускаем
+        find_text()
+        return
+
+    current_pos = text_area.index("found_pos")
+    # Ищем следующее совпадение после текущего
+    end_pos = f"{current_pos}+{len(query)}c"
+    next_pos = text_area.search(query, end_pos, stopindex=tk.END, nocase=True)
+
+    if not next_pos:
+        # Если дошли до конца — начинаем сначала
+        next_pos = text_area.search(query, "1.0", stopindex=tk.END, nocase=True)
+        if not next_pos:
+            return
+
+    # Снимаем выделение с предыдущего и выделяем новое
+    end_pos = f"{next_pos}+{len(query)}c"
+    text_area.tag_remove("current", "1.0", tk.END)
+    text_area.tag_add("current", next_pos, end_pos)
+    text_area.see(next_pos)
+    text_area.mark_set("found_pos", next_pos)
+
+
+def clear_highlight():
+    """Убирает всю подсветку"""
+    text_area.tag_remove("highlight", "1.0", tk.END)
+    text_area.tag_remove("current", "1.0", tk.END)
+    search_entry.delete(0, tk.END)  # Очищаем поле поиска
+
+    # Возвращаем обычный заголовок
+    if hasattr(text_area, 'last_file') and text_area.last_file:
+        window.title(f"Моя читалка - {os.path.basename(text_area.last_file)}")
+    else:
+        window.title("Моя читалка")
+
+
 # === ГЛАВНОЕ ОКНО ===
 # Создаём главное окно
 window = tk.Tk()
 window.title("Моя читалка")
 window.geometry("600x400")  # ширина x высота
+
+# === ВЕРХНЯЯ ПАНЕЛЬ ПОИСКА ===
+search_frame = tk.Frame(window)
+search_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+
+# Метка "Поиск:"
+label_search = tk.Label(search_frame, text="Поиск:")
+label_search.pack(side=tk.LEFT, padx=5)
+
+# Поле ввода для поиска
+search_entry = tk.Entry(search_frame, width=30)
+search_entry.pack(side=tk.LEFT, padx=5)
+
+# Кнопка "Найти"
+btn_find = tk.Button(search_frame, text="Найти", command=find_text, width=8)
+btn_find.pack(side=tk.LEFT, padx=5)
+
+# Кнопка "Найти далее"
+btn_find_next = tk.Button(search_frame, text="Далее", command=find_next, width=8)
+btn_find_next.pack(side=tk.LEFT, padx=5)
+
+# Кнопка "Очистить"
+btn_clear = tk.Button(search_frame, text="Очистить", command=clear_highlight, width=8)
+btn_clear.pack(side=tk.LEFT, padx=5)
 
 # Нижняя панель с кнопками
 bottom_frame = tk.Frame(window)
@@ -139,6 +255,9 @@ text_area.pack(fill=tk.BOTH, expand=True)
 # Привязываем событие прокрутки к текстовому полю
 text_area.bind("<Configure>", save_scroll_position)
 
+# Настраиваем тег для подсветки найденных слов
+text_area.tag_config("highlight", background="yellow", foreground="black")
+text_area.tag_config("current", background="orange", foreground="black")
 
 # Привязываем обработчик к крестику окна
 window.protocol("WM_DELETE_WINDOW", on_closing)
@@ -154,6 +273,11 @@ apply_font()
 
 if last_file and os.path.exists(last_file):
     load_book(last_file, scroll_position)
+
+# Горячие клавиши
+window.bind("<Control-f>", lambda e: search_entry.focus_set())  # Ctrl+F — фокус на поиск
+window.bind("<Return>", find_next)                              # Enter — найти далее
+window.bind("<Escape>", lambda e: clear_highlight())            # Escape — очистить
 
 # === ЗАПУСК ===
 # Запускаем главный цикл окна
