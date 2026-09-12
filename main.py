@@ -3,10 +3,86 @@ import tkinter as tk # подгружаем запрос к библиотеке
 from tkinter import filedialog, scrolledtext
 import json
 import os
+import xml.etree.ElementTree as ET
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+import pymupdf
 
 # === НАСТРОЙКИ ===
 SETTINGS_FILE = "reader_settings.json"
 current_font_size = 14  # Текущий размер шрифта
+
+
+def read_pdf(file_path):
+    """Читает PDF и возвращает текст"""
+    try:
+        doc = pymupdf.open(file_path)
+        full_text = []
+
+        for page in doc:
+            text = page.get_text()
+            if text:
+                full_text.append(text)
+
+        doc.close()
+        return "\n".join(full_text)
+    except Exception as e:
+        return f"Ошибка чтения PDF: {e}"
+
+
+def read_epub(file_path):
+    """Читает EPUB и возвращает текст"""
+    try:
+        book = epub.read_epub(file_path)
+        full_text = []
+
+        # Идём по всем документам в правильном порядке (spine)
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            html_content = item.get_content()
+
+            # Парсим HTML
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            # Извлекаем текст из параграфов и заголовков
+            for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                text = tag.get_text(separator=' ', strip=True)
+                if text:
+                    full_text.append(text)
+                    full_text.append("")
+
+        return "\n".join(full_text)
+    except Exception as e:
+        return f"Ошибка чтения EPUB: {e}"
+
+
+def read_fb2(file_path):
+    """Читает FB2 и возвращает текст"""
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+
+        # Пространство имён FB2 (обязательно для поиска тегов)
+        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
+
+        lines = []
+
+        # Ищем все параграфы и заголовки
+        for elem in root.iter():
+            # Параграфы
+            if elem.tag == '{http://www.gribuser.ru/xml/fictionbook/2.0}p':
+                if elem.text and elem.text.strip():
+                    lines.append(elem.text.strip())
+                    lines.append("")  # Пустая строка после параграфа
+            # Заголовки
+            elif elem.tag == '{http://www.gribuser.ru/xml/fictionbook/2.0}title':
+                if elem.text and elem.text.strip():
+                    lines.append(f"*** {elem.text.strip()} ***")
+                    lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Ошибка чтения FB2: {e}"
 
 
 def save_settings(file_path, scroll_position=0.0, font_size=14):
@@ -38,20 +114,36 @@ def load_settings():
 
 
 # === ФУНКЦИЯ ЗАГРУЗКИ КНИГИ ===
-def load_book(file_path, scroll_position=0):
+def load_book(file_path, scroll_position=0.0):
     """Загружает книгу и восстанавливает позицию прокрутки"""
     if not os.path.exists(file_path):
         return False
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        # Определяем формат по расширению
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext == '.txt':
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        elif ext == '.fb2':
+            content = read_fb2(file_path)
+        elif ext == '.epub':
+            content = read_epub(file_path)
+        elif ext == '.pdf':
+            content = read_pdf(file_path)
+        else:
+            content = f"Формат {ext} не поддерживается."
+
+        # Отображаем текст
         text_area.delete("1.0", tk.END)
         text_area.insert(tk.END, content)
         # Запоминаем путь к файлу прямо в текстовом поле
         text_area.last_file = file_path
+
         # Восстанавливаем позицию прокрутки
         if scroll_position > 0:
             text_area.yview_moveto(scroll_position)
+
         window.title(f"Моя читалка - {os.path.basename(file_path)}")
         return True
     except Exception as e:
@@ -61,11 +153,19 @@ def load_book(file_path, scroll_position=0):
 
 # === ФУНКЦИЯ ОТКРЫТИЯ ФАЙЛА ===
 def open_file():  # Открываем диалог выбора файла (только .txt)
-    file_path = filedialog.askopenfilename(filetypes=[("Текстовые файлы", "*.txt")])
+    file_path = filedialog.askopenfilename(
+        filetypes=[
+            ("Все поддерживаемые", "*.txt *.fb2 *.epub *.pdf"),
+            ("Текстовые файлы", "*.txt"),
+            ("Книги FB2", "*.fb2"),
+            ("Книги EPUB", "*.epub"),
+            ("Документы PDF", "*.pdf"),
+        ]
+    )
     if file_path:  # если пользователь выбрал файл
         if load_book(file_path):
             # Сохраняем настройки (позиция будет сохранена позже при скролле)
-            save_settings(file_path, 0, current_font_size)
+            save_settings(file_path, 0.0, current_font_size)
 
 
 # === СОХРАНЕНИЕ ПОЗИЦИИ ===
