@@ -1,6 +1,6 @@
-# а почему не подсвечивается красиво?
 import tkinter as tk # подгружаем запрос к библиотеке "tkinter" и обзываем её "tk".
 from tkinter import filedialog, scrolledtext
+from tkinter import ttk        # <-- НОВОЕ: "тематизированные" виджеты (Treeview, Scrollbar и др.)
 import json
 import os
 import xml.etree.ElementTree as ET
@@ -12,6 +12,7 @@ import pymupdf
 # === НАСТРОЙКИ ===
 SETTINGS_FILE = "reader_settings.json"
 current_font_size = 14  # Текущий размер шрифта
+toc_visible = False        # видна ли сейчас панель оглавления
 
 
 def read_pdf(file_path):
@@ -32,57 +33,156 @@ def read_pdf(file_path):
 
 
 def read_epub(file_path):
-    """Читает EPUB и возвращает текст"""
+    """Читает EPUB. Возвращает (текст, оглавление)."""
     try:
         book = epub.read_epub(file_path)
-        full_text = []
+        lines = []
+        # Словарь: имя файла внутри EPUB -> номер строки, с которой он начинается
+        file_start_lines = {}
 
-        # Идём по всем документам в правильном порядке (spine)
+        # 1) Идём по всем документам и собираем текст, запоминая стартовые строки
         for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            html_content = item.get_content()
+            file_name = item.get_name()
+            file_start_lines[file_name] = len(lines)
 
-            # Парсим HTML
+            html_content = item.get_content()
             soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Извлекаем текст из параграфов и заголовков
             for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
                 text = tag.get_text(separator=' ', strip=True)
                 if text:
-                    full_text.append(text)
-                    full_text.append("")
+                    lines.append(text)
+                    lines.append("")
 
-        return "\n".join(full_text)
+        # 2) Из book.toc строим плоский список с уровнями
+        toc = []
+
+        def walk(items, level):
+            """Рекурсивно обходит структуру оглавления EPUB."""
+            for item in items:
+                # Элемент вида (Section, [дети])
+                if isinstance(item, tuple):
+                    section, children = item
+                    # Section — это не ссылка, а просто «папка». Показываем её как заголовок.
+                    if getattr(section, 'title', None):
+                        toc.append((section.title, -1, level))  # -1 = некуда переходить
+                        walk(children, level + 1)
+                    else:
+                        walk(children, level)
+                # Элемент-ссылка на файл
+                elif isinstance(item, epub.Link):
+                    href = item.href.split('#')[0]  # убираем якорь после #
+                    line = file_start_lines.get(href, 0)
+                    title = item.title or "Без названия"
+                    toc.append((title, line, level))
+
+        walk(book.toc, 0)
+        return "\n".join(lines), toc
+
     except Exception as e:
-        return f"Ошибка чтения EPUB: {e}"
+        return f"Ошибка чтения EPUB: {e}", []
 
 
 def read_fb2(file_path):
-    """Читает FB2 и возвращает текст"""
+    """Читает FB2. Возвращает (текст, оглавление).
+    Оглавление — список кортежей (название, номер_строки, уровень).
+    """
     try:
-        tree = ET.parse(file_path)
-        root = tree.getroot()
+        # --- 1) Читаем файл с автоопределением кодировки ---
+        raw = open(file_path, "rb").read()
+        # Пробуем популярные кодировки FB2 по очереди
+        text_data = None
+        for enc in ("utf-8", "windows-1251", "cp1251"):
+            try:
+                text_data = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text_data is None:
+            return "Не удалось определить кодировку FB2", []
 
-        # Пространство имён FB2 (обязательно для поиска тегов)
-        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
+        # --- 2) Парсим XML из строки (а не из файла — так надёжнее с кодировками) ---
+        root = ET.fromstring(text_data)
 
-        lines = []
+        NS = '{http://www.gribuser.ru/xml/fictionbook/2.0}'
+        lines = []   # сюда собираем строки текста
+        toc = []     # сюда собираем главы
 
-        # Ищем все параграфы и заголовки
-        for elem in root.iter():
-            # Параграфы
-            if elem.tag == '{http://www.gribuser.ru/xml/fictionbook/2.0}p':
-                if elem.text and elem.text.strip():
-                    lines.append(elem.text.strip())
-                    lines.append("")  # Пустая строка после параграфа
-            # Заголовки
-            elif elem.tag == '{http://www.gribuser.ru/xml/fictionbook/2.0}title':
-                if elem.text and elem.text.strip():
-                    lines.append(f"*** {elem.text.strip()} ***")
+        def title_to_string(title_elem):
+            """Собирает текст из <title> (может состоять из нескольких <p>)."""
+            parts = []
+            for p in title_elem.iter(f'{NS}p'):
+                # itertext() — весь текст внутри тега, включая вложенные <emphasis>, <strong> и т.п.
+                t = "".join(p.itertext()).strip()
+                if t:
+                    parts.append(t)
+            return " ".join(parts)
+
+        def process_section(section, level):
+            """Обходит одну секцию (главу) и её вложенные секции."""
+            # --- Заголовок секции ---
+            title_elem = section.find(f'{NS}title')
+            if title_elem is not None:
+                title = title_to_string(title_elem)
+                if title:
+                    toc.append((title, len(lines), level))   # номер строки ДО добавления
+                    lines.append(f"*** {title} ***")
                     lines.append("")
 
-        return "\n".join(lines)
+            # --- Дочерние элементы секции ---
+            for child in section:
+                tag = child.tag
+                if tag == f'{NS}section':
+                    process_section(child, level + 1)        # рекурсия во вложенную секцию
+                elif tag == f'{NS}title':
+                    continue                                 # уже обработали выше
+                elif tag in (f'{NS}p', f'{NS}subtitle'):
+                    # get_text через itertext склеит текст даже из сложных параграфов
+                    t = "".join(child.itertext()).strip()
+                    if t:
+                        lines.append(t)
+                        lines.append("")
+                elif tag == f'{NS}empty-line':
+                    lines.append("")
+                elif tag == f'{NS}epigraph':
+                    # эпиграфы тоже читаем как обычный текст
+                    for p in child.iter(f'{NS}p'):
+                        t = "".join(p.itertext()).strip()
+                        if t:
+                            lines.append(t)
+                            lines.append("")
+
+        # --- 3) Идём ТОЛЬКО по <body>, игнорируя <description> ---
+        for body in root.findall(f'{NS}body'):
+            # type="notes" — сноски, обычно их в основном тексте не нужно показывать рядом
+            # Если хотите — можно оставить. Здесь пропускаем сноски:
+            if body.get('type') == 'notes':
+                continue
+
+            for child in body:
+                if child.tag == f'{NS}section':
+                    process_section(child, 0)
+                elif child.tag == f'{NS}title':
+                    title = title_to_string(child)
+                    if title:
+                        lines.append(f"*** {title} ***")
+                        lines.append("")
+                elif child.tag == f'{NS}p':
+                    t = "".join(child.itertext()).strip()
+                    if t:
+                        lines.append(t)
+                        lines.append("")
+                elif child.tag == f'{NS}epigraph':
+                    for p in child.iter(f'{NS}p'):
+                        t = "".join(p.itertext()).strip()
+                        if t:
+                            lines.append(t)
+                            lines.append("")
+
+        return "\n".join(lines), toc
+
     except Exception as e:
-        return f"Ошибка чтения FB2: {e}"
+        return f"Ошибка чтения FB2: {e}", []
 
 
 def save_settings(file_path, scroll_position=0.0, font_size=14):
@@ -121,14 +221,15 @@ def load_book(file_path, scroll_position=0.0):
     try:
         # Определяем формат по расширению
         ext = os.path.splitext(file_path)[1].lower()
+        toc = []  # по умолчанию пусто (для TXT, PDF)
 
         if ext == '.txt':
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
         elif ext == '.fb2':
-            content = read_fb2(file_path)
+            content, toc = read_fb2(file_path)  # ← распаковываем кортеж
         elif ext == '.epub':
-            content = read_epub(file_path)
+            content, toc = read_epub(file_path)  # ← и здесь тоже
         elif ext == '.pdf':
             content = read_pdf(file_path)
         else:
@@ -145,6 +246,10 @@ def load_book(file_path, scroll_position=0.0):
             text_area.yview_moveto(scroll_position)
 
         window.title(f"Моя читалка - {os.path.basename(file_path)}")
+
+        # === НОВОЕ: заполняем оглавление ===
+        populate_toc(toc)
+
         return True
     except Exception as e:
         print(f"Ошибка загрузки файла: {e}")
@@ -153,6 +258,7 @@ def load_book(file_path, scroll_position=0.0):
 
 # === ФУНКЦИЯ ОТКРЫТИЯ ФАЙЛА ===
 def open_file():  # Открываем диалог выбора файла (только .txt)
+    print("open_file вызвана")  # ← временно
     file_path = filedialog.askopenfilename(
         filetypes=[
             ("Все поддерживаемые", "*.txt *.fb2 *.epub *.pdf"),
@@ -303,6 +409,80 @@ def clear_highlight():
         window.title("Моя читалка")
 
 
+# === НОВОЕ: ОГЛАВЛЕНИЕ ===
+
+def populate_toc(toc_entries):
+    """Заполняет дерево оглавления.
+    toc_entries — список кортежей (название, номер_строки, уровень)."""
+    # 1) Очищаем дерево
+    for item in toc_tree.get_children():
+        toc_tree.delete(item)
+
+    # 2) Строим иерархию.
+    # parents[level] = id родителя для элементов этого уровня.
+    # parents[0] = "" (корень дерева — пустая строка).
+    parents = [""]
+
+    for title, line, level in toc_entries:
+        # Если вернулись на более высокий уровень — подрезаем лишних «родителей»
+        if len(parents) > level + 1:
+            del parents[level + 1:]
+        # Добираем недостающие уровни (бывает в кривых FB2/EPUB)
+        while len(parents) <= level:
+            parents.append("")
+
+        parent = parents[level]
+        # values=(line,) — кладём номер строки внутрь элемента дерева
+        item_id = toc_tree.insert(parent, 'end', text=title, values=(line,))
+
+        # Этот элемент становится родителем для следующего уровня
+        if len(parents) > level + 1:
+            parents[level + 1] = item_id
+        else:
+            parents.append(item_id)
+
+
+def on_toc_select(event=None):
+    """Вызывается при выборе элемента в оглавлении — переходим к главе."""
+    selected = toc_tree.selection()
+    if not selected:
+        return
+    values = toc_tree.item(selected[0], 'values')
+    if not values:
+        return
+
+    try:
+        line_number = int(values[0])
+    except (ValueError, IndexError):
+        return
+
+    # -1 означает «это просто заголовок-папка, переходить некуда»
+    if line_number < 0:
+        return
+
+    # Прокручиваем так, чтобы глава оказалась вверху окна
+    total_lines = int(text_area.index('end-1c').split('.')[0])
+    if total_lines > 0:
+        fraction = line_number / total_lines
+        text_area.yview_moveto(fraction)
+    text_area.see(f"{line_number + 1}.0")
+    text_area.mark_set(tk.INSERT, f"{line_number + 1}.0")
+
+
+def toggle_toc():
+    """Показывает/скрывает панель оглавления."""
+    global toc_visible
+    if toc_visible:
+        toc_frame.pack_forget()
+        toc_visible = False
+        btn_toc.config(text="☰ Оглавление")
+    else:
+        # before=text_area — вставляем панель ЛЕВЕЕ текстового поля
+        toc_frame.pack(side=tk.LEFT, fill=tk.Y, before=text_area)
+        toc_visible = True
+        btn_toc.config(text="✕ Скрыть")
+
+
 # === ГЛАВНОЕ ОКНО ===
 # Создаём главное окно
 window = tk.Tk()
@@ -337,10 +517,13 @@ btn_clear.pack(side=tk.LEFT, padx=5)
 bottom_frame = tk.Frame(window)
 bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
 
-# Кнопка "Открыть файл" слева. Размещаем сначала кнопку над текстовой зоной,
-# чтобы она прогружалась первой. Так мы избежим выдавливания кнопки при малом размере окна.
+# Кнопка "Открыть файл" слева
 btn_open = tk.Button(bottom_frame, text="Открыть файл", command=open_file)
 btn_open.pack(side=tk.LEFT, padx=10)
+
+# === НОВОЕ: кнопка переключения оглавления ===
+btn_toc = tk.Button(bottom_frame, text="☰ Оглавление", command=toggle_toc, width=14)
+btn_toc.pack(side=tk.LEFT, padx=10)
 
 # Кнопки изменения шрифта справа
 btn_font_minus = tk.Button(bottom_frame, text="A−", command=decrease_font, width=4)
@@ -349,9 +532,37 @@ btn_font_minus.pack(side=tk.RIGHT, padx=5)
 btn_font_plus = tk.Button(bottom_frame, text="A+", command=increase_font, width=4)
 btn_font_plus.pack(side=tk.RIGHT, padx=5)
 
-# Создаём текстовое поле с прокруткой
-text_area = scrolledtext.ScrolledText(window, wrap=tk.WORD, font=("Arial", current_font_size))
-text_area.pack(fill=tk.BOTH, expand=True)
+# === НОВОЕ: контейнер, внутри которого будут оглавление (слева) и текст ===
+content_frame = tk.Frame(window)
+content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+# --- Панель оглавления (сначала скрыта) ---
+toc_frame = tk.Frame(content_frame, bg="#f0f0f0")
+
+toc_label = tk.Label(toc_frame, text="Оглавление",
+                     font=("Arial", 11, "bold"), bg="#f0f0f0")
+toc_label.pack(side=tk.TOP, fill=tk.X, pady=5)
+
+# Вертикальная прокрутка для дерева
+toc_scroll = tk.Scrollbar(toc_frame, orient="vertical")
+toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+# Само дерево оглавления
+toc_tree = ttk.Treeview(toc_frame, show='tree', selectmode='browse',
+                        yscrollcommand=toc_scroll.set, height=30)
+toc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+toc_scroll.config(command=toc_tree.yview)
+
+# Клик по элементу дерева — переход к главе
+toc_tree.bind('<<TreeviewSelect>>', on_toc_select)
+
+# --- Текстовое поле ---
+text_area = scrolledtext.ScrolledText(content_frame, wrap=tk.WORD, font=("Arial", current_font_size))
+text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+# Привязываем событие прокрутки к текстовому полю
+text_area.bind("<Configure>", save_scroll_position)
+
 # Привязываем событие прокрутки к текстовому полю
 text_area.bind("<Configure>", save_scroll_position)
 
@@ -378,6 +589,7 @@ if last_file and os.path.exists(last_file):
 window.bind("<Control-f>", lambda e: search_entry.focus_set())  # Ctrl+F — фокус на поиск
 window.bind("<Return>", find_next)                              # Enter — найти далее
 window.bind("<Escape>", lambda e: clear_highlight())            # Escape — очистить
+window.bind("<Control-o>", lambda e: open_file())               # Ctrl+O — открыть новый файл
 
 # === ЗАПУСК ===
 # Запускаем главный цикл окна
