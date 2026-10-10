@@ -1,96 +1,96 @@
-import tkinter as tk # подгружаем запрос к библиотеке "tkinter" и обзываем её "tk".
-from tkinter import filedialog, scrolledtext
-from tkinter import ttk        # <-- НОВОЕ: "тематизированные" виджеты (Treeview, Scrollbar и др.)
+# -*- coding: utf-8 -*-
+"""
+╔═══════════════════════════════════════════════════════════════════════╗
+║  МОЯ ЧИТАЛКА — приложение для чтения электронных книг                 ║
+║                                                                       ║
+║  Форматы:  TXT, FB2, EPUB, PDF                                        ║
+║  Режимы:   скроллинг (непрерывный)  /  листание (постраничный)        ║
+║  Функции:  оглавление, поиск с подсветкой, размер шрифта,             ║
+║            сохранение позиции чтения, удобные горячие клавиши         ║
+║                                                                       ║
+║  Установка зависимостей:                                              ║
+║     pip install ebooklib beautifulsoup4 pymupdf                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+"""
+
 import json
 import os
+import tkinter as tk
+import tkinter.font as tkfont
 import xml.etree.ElementTree as ET
-import ebooklib
-from ebooklib import epub
-from bs4 import BeautifulSoup
-import pymupdf
+from tkinter import ttk, filedialog, messagebox
 
-# === НАСТРОЙКИ ===
+# --- Необязательные библиотеки (для EPUB и PDF) ---
+try:
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+    EPUB_OK = True
+except ImportError:
+    EPUB_OK = False
+
+try:
+    import pymupdf
+    PDF_OK = True
+except ImportError:
+    PDF_OK = False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  НАСТРОЙКИ ВНЕШНЕГО ВИДА
+# ══════════════════════════════════════════════════════════════════════
+
 SETTINGS_FILE = "reader_settings.json"
-current_font_size = 14  # Текущий размер шрифта
-toc_visible = False        # видна ли сейчас панель оглавления
+
+# Тёплая бежевая палитра — приятна для чтения, не утомляет глаза
+COLORS = {
+    "bg":         "#f4f1ea",   # фон окна
+    "panel":      "#ffffff",   # панели (тулбар, статус-бар, оглавление)
+    "text_bg":    "#fdfaf3",   # фон страницы с текстом книги
+    "text_fg":    "#2b2b2b",   # цвет текста книги
+    "accent":     "#8b6f47",   # акцентный (коричневый)
+    "accent_hov": "#a68656",   # акцентный при наведении
+    "muted":      "#7a7a7a",   # приглушённый серый
+    "border":     "#d8d2c4",   # разделительные линии
+}
+
+# Базовые шрифты (могут быть переопределены ниже, если их нет в системе)
+READ_FONT = "Georgia"     # для текста книги — serif читать легче
+UI_FONT   = "Segoe UI"    # для интерфейса
 
 
-def read_pdf(file_path):
-    """Читает PDF и возвращает текст"""
+# ══════════════════════════════════════════════════════════════════════
+#  ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+# ══════════════════════════════════════════════════════════════════════
+
+current_font_size = 16     # текущий размер шрифта книги
+reading_mode      = "scroll"   # "scroll" | "page"
+toc_visible       = False  # видна ли панель оглавления
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ЧТЕНИЕ ФАЙЛОВ РАЗНЫХ ФОРМАТОВ
+#  Каждая функция возвращает кортеж: (текст, оглавление, заголовки)
+#     оглавление = [(название, номер_строки, уровень), ...]
+#     заголовки  = [(номер_строки, уровень), ...]   — для стилизации
+# ══════════════════════════════════════════════════════════════════════
+
+def read_txt(path):
+    """Читает TXT с автоопределением кодировки."""
+    raw = open(path, "rb").read()
+    for enc in ("utf-8", "windows-1251", "cp1251", "koi8-r", "latin-1"):
+        try:
+            return raw.decode(enc), [], []
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), [], []
+
+
+def read_fb2(path):
+    """Читает FB2. Разбирает только <body>, пропуская <description>."""
     try:
-        doc = pymupdf.open(file_path)
-        full_text = []
-
-        for page in doc:
-            text = page.get_text()
-            if text:
-                full_text.append(text)
-
-        doc.close()
-        return "\n".join(full_text)
-    except Exception as e:
-        return f"Ошибка чтения PDF: {e}"
-
-
-def read_epub(file_path):
-    """Читает EPUB. Возвращает (текст, оглавление)."""
-    try:
-        book = epub.read_epub(file_path)
-        lines = []
-        # Словарь: имя файла внутри EPUB -> номер строки, с которой он начинается
-        file_start_lines = {}
-
-        # 1) Идём по всем документам и собираем текст, запоминая стартовые строки
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            file_name = item.get_name()
-            file_start_lines[file_name] = len(lines)
-
-            html_content = item.get_content()
-            soup = BeautifulSoup(html_content, 'html.parser')
-
-            for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-                text = tag.get_text(separator=' ', strip=True)
-                if text:
-                    lines.append(text)
-                    lines.append("")
-
-        # 2) Из book.toc строим плоский список с уровнями
-        toc = []
-
-        def walk(items, level):
-            """Рекурсивно обходит структуру оглавления EPUB."""
-            for item in items:
-                # Элемент вида (Section, [дети])
-                if isinstance(item, tuple):
-                    section, children = item
-                    # Section — это не ссылка, а просто «папка». Показываем её как заголовок.
-                    if getattr(section, 'title', None):
-                        toc.append((section.title, -1, level))  # -1 = некуда переходить
-                        walk(children, level + 1)
-                    else:
-                        walk(children, level)
-                # Элемент-ссылка на файл
-                elif isinstance(item, epub.Link):
-                    href = item.href.split('#')[0]  # убираем якорь после #
-                    line = file_start_lines.get(href, 0)
-                    title = item.title or "Без названия"
-                    toc.append((title, line, level))
-
-        walk(book.toc, 0)
-        return "\n".join(lines), toc
-
-    except Exception as e:
-        return f"Ошибка чтения EPUB: {e}", []
-
-
-def read_fb2(file_path):
-    """Читает FB2. Возвращает (текст, оглавление).
-    Оглавление — список кортежей (название, номер_строки, уровень).
-    """
-    try:
-        # --- 1) Читаем файл с автоопределением кодировки ---
-        raw = open(file_path, "rb").read()
-        # Пробуем популярные кодировки FB2 по очереди
+        # сами определяем кодировку — так надёжнее, чем ET.parse(file)
+        raw = open(path, "rb").read()
         text_data = None
         for enc in ("utf-8", "windows-1251", "cp1251"):
             try:
@@ -99,500 +99,796 @@ def read_fb2(file_path):
             except UnicodeDecodeError:
                 continue
         if text_data is None:
-            return "Не удалось определить кодировку FB2", []
+            return "Не удалось определить кодировку FB2", [], []
 
-        # --- 2) Парсим XML из строки (а не из файла — так надёжнее с кодировками) ---
         root = ET.fromstring(text_data)
+        NS = "{http://www.gribuser.ru/xml/fictionbook/2.0}"
 
-        NS = '{http://www.gribuser.ru/xml/fictionbook/2.0}'
-        lines = []   # сюда собираем строки текста
-        toc = []     # сюда собираем главы
+        lines, toc, headings = [], [], []
 
-        def title_to_string(title_elem):
-            """Собирает текст из <title> (может состоять из нескольких <p>)."""
+        def title_to_string(el):
+            """Собирает текст заголовка из всех <p> внутри <title>."""
             parts = []
-            for p in title_elem.iter(f'{NS}p'):
-                # itertext() — весь текст внутри тега, включая вложенные <emphasis>, <strong> и т.п.
+            for p in el.iter(f"{NS}p"):
                 t = "".join(p.itertext()).strip()
                 if t:
                     parts.append(t)
             return " ".join(parts)
 
-        def process_section(section, level):
-            """Обходит одну секцию (главу) и её вложенные секции."""
-            # --- Заголовок секции ---
-            title_elem = section.find(f'{NS}title')
-            if title_elem is not None:
-                title = title_to_string(title_elem)
+        def walk_section(section, level):
+            """Рекурсивный обход секции (главы)."""
+            title_el = section.find(f"{NS}title")
+            if title_el is not None:
+                title = title_to_string(title_el)
                 if title:
-                    toc.append((title, len(lines), level))   # номер строки ДО добавления
-                    lines.append(f"*** {title} ***")
+                    toc.append((title, len(lines), level))
+                    headings.append((len(lines), level))
+                    lines.append(title)
                     lines.append("")
 
-            # --- Дочерние элементы секции ---
             for child in section:
                 tag = child.tag
-                if tag == f'{NS}section':
-                    process_section(child, level + 1)        # рекурсия во вложенную секцию
-                elif tag == f'{NS}title':
-                    continue                                 # уже обработали выше
-                elif tag in (f'{NS}p', f'{NS}subtitle'):
-                    # get_text через itertext склеит текст даже из сложных параграфов
+                if tag == f"{NS}section":
+                    walk_section(child, level + 1)
+                elif tag == f"{NS}title":
+                    continue
+                elif tag in (f"{NS}p", f"{NS}subtitle"):
                     t = "".join(child.itertext()).strip()
                     if t:
                         lines.append(t)
                         lines.append("")
-                elif tag == f'{NS}empty-line':
+                elif tag == f"{NS}empty-line":
                     lines.append("")
-                elif tag == f'{NS}epigraph':
-                    # эпиграфы тоже читаем как обычный текст
-                    for p in child.iter(f'{NS}p'):
+                elif tag == f"{NS}epigraph":
+                    for p in child.iter(f"{NS}p"):
                         t = "".join(p.itertext()).strip()
                         if t:
                             lines.append(t)
                             lines.append("")
 
-        # --- 3) Идём ТОЛЬКО по <body>, игнорируя <description> ---
-        for body in root.findall(f'{NS}body'):
-            # type="notes" — сноски, обычно их в основном тексте не нужно показывать рядом
-            # Если хотите — можно оставить. Здесь пропускаем сноски:
-            if body.get('type') == 'notes':
+        # обходим <body> — но пропускаем <body type="notes"> (сноски)
+        for body in root.findall(f"{NS}body"):
+            if body.get("type") == "notes":
                 continue
-
             for child in body:
-                if child.tag == f'{NS}section':
-                    process_section(child, 0)
-                elif child.tag == f'{NS}title':
+                if child.tag == f"{NS}section":
+                    walk_section(child, 0)
+                elif child.tag == f"{NS}title":
                     title = title_to_string(child)
                     if title:
-                        lines.append(f"*** {title} ***")
+                        headings.append((len(lines), 0))
+                        lines.append(title)
                         lines.append("")
-                elif child.tag == f'{NS}p':
+                elif child.tag == f"{NS}p":
                     t = "".join(child.itertext()).strip()
                     if t:
                         lines.append(t)
                         lines.append("")
-                elif child.tag == f'{NS}epigraph':
-                    for p in child.iter(f'{NS}p'):
-                        t = "".join(p.itertext()).strip()
-                        if t:
-                            lines.append(t)
-                            lines.append("")
 
-        return "\n".join(lines), toc
-
+        return "\n".join(lines), toc, headings
     except Exception as e:
-        return f"Ошибка чтения FB2: {e}", []
+        return f"Ошибка чтения FB2: {e}", [], []
 
 
-def save_settings(file_path, scroll_position=0.0, font_size=14):
-    """Сохраняет настройки: путь к файлу, позицию, размер шрифта"""
-    settings = {
-        "last_file": file_path,
-        "scroll_position": scroll_position,
-        "font_size": font_size
-    }
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+def read_epub(path):
+    """Читает EPUB: собирает текст из HTML-файлов и оглавление из book.toc."""
+    if not EPUB_OK:
+        return ("Для EPUB нужно установить:\npip install ebooklib beautifulsoup4",
+                [], [])
+    try:
+        book = epub.read_epub(path)
+        lines, headings = [], []
+        file_start = {}  # имя_файла_в_epub → номер строки
 
+        # 1) собираем текст из всех документов, запоминая стартовые строки
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            file_start[item.get_name()] = len(lines)
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6"]):
+                text = tag.get_text(separator=" ", strip=True)
+                if not text:
+                    continue
+                if tag.name.startswith("h"):
+                    headings.append((len(lines), int(tag.name[1]) - 1))
+                lines.append(text)
+                lines.append("")
+
+        # 2) строим плоское оглавление из book.toc (может быть вложенным)
+        toc = []
+
+        def walk(items, level):
+            for item in items:
+                if isinstance(item, tuple):
+                    sec, children = item
+                    if getattr(sec, "title", None):
+                        toc.append((sec.title, -1, level))
+                        walk(children, level + 1)
+                    else:
+                        walk(children, level)
+                elif isinstance(item, epub.Link):
+                    href = item.href.split("#")[0]
+                    toc.append((item.title or "Без названия",
+                                file_start.get(href, 0), level))
+
+        walk(book.toc, 0)
+        return "\n".join(lines), toc, headings
+    except Exception as e:
+        return f"Ошибка чтения EPUB: {e}", [], []
+
+
+def read_pdf(path):
+    """Читает PDF, возвращает сплошной текст."""
+    if not PDF_OK:
+        return ("Для PDF нужно установить:\npip install pymupdf", [], [])
+    try:
+        doc = pymupdf.open(path)
+        parts = [page.get_text() for page in doc if page.get_text()]
+        doc.close()
+        return "\n".join(parts), [], []
+    except Exception as e:
+        return f"Ошибка чтения PDF: {e}", [], []
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  СОХРАНЕНИЕ И ЗАГРУЗКА НАСТРОЕК
+# ══════════════════════════════════════════════════════════════════════
 
 def load_settings():
-    """Загружает сохранённые настройки"""
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-            return {
-                "last_file": settings.get("last_file", ""),
-                "scroll_position": settings.get("scroll_position", 0),
-                "font_size": settings.get("font_size", 14)
-            }
-    return {     # Если файла нет — возвращаем значения по умолчанию
+    """Возвращает словарь настроек (из файла или по умолчанию)."""
+    defaults = {
         "last_file": "",
-        "scroll_position": 0,
-        "font_size": 14
+        "scroll_position": 0.0,
+        "font_size": 16,
+        "reading_mode": "scroll",
+        "toc_visible": False,
+        "geometry": "1000x700",
     }
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                defaults.update(json.load(f))
+        except Exception:
+            pass
+    return defaults
 
 
-# === ФУНКЦИЯ ЗАГРУЗКИ КНИГИ ===
-def load_book(file_path, scroll_position=0.0):
-    """Загружает книгу и восстанавливает позицию прокрутки"""
-    if not os.path.exists(file_path):
-        return False
+def save_settings(**kwargs):
+    """Обновляет и сохраняет настройки."""
+    data = load_settings()
+    data.update(kwargs)
     try:
-        # Определяем формат по расширению
-        ext = os.path.splitext(file_path)[1].lower()
-        toc = []  # по умолчанию пусто (для TXT, PDF)
-
-        if ext == '.txt':
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        elif ext == '.fb2':
-            content, toc = read_fb2(file_path)  # ← распаковываем кортеж
-        elif ext == '.epub':
-            content, toc = read_epub(file_path)  # ← и здесь тоже
-        elif ext == '.pdf':
-            content = read_pdf(file_path)
-        else:
-            content = f"Формат {ext} не поддерживается."
-
-        # Отображаем текст
-        text_area.delete("1.0", tk.END)
-        text_area.insert(tk.END, content)
-        # Запоминаем путь к файлу прямо в текстовом поле
-        text_area.last_file = file_path
-
-        # Восстанавливаем позицию прокрутки
-        if scroll_position > 0:
-            text_area.yview_moveto(scroll_position)
-
-        window.title(f"Моя читалка - {os.path.basename(file_path)}")
-
-        # === НОВОЕ: заполняем оглавление ===
-        populate_toc(toc)
-
-        return True
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Ошибка загрузки файла: {e}")
-        return False
+        print(f"Не удалось сохранить настройки: {e}")
 
 
-# === ФУНКЦИЯ ОТКРЫТИЯ ФАЙЛА ===
-def open_file():  # Открываем диалог выбора файла (только .txt)
-    print("open_file вызвана")  # ← временно
-    file_path = filedialog.askopenfilename(
+# ══════════════════════════════════════════════════════════════════════
+#  ГЛАВНОЕ ОКНО
+# ══════════════════════════════════════════════════════════════════════
+
+root = tk.Tk()
+root.title("Моя читалка")
+root.configure(bg=COLORS["bg"])
+root.minsize(760, 500)
+
+# --- проверяем доступность красивых шрифтов ---
+_families = set(tkfont.families())
+if READ_FONT not in _families:
+    for candidate in ("Times New Roman", "DejaVu Serif", "Liberation Serif"):
+        if candidate in _families:
+            READ_FONT = candidate
+            break
+if UI_FONT not in _families:
+    for candidate in ("DejaVu Sans", "Arial", "Helvetica"):
+        if candidate in _families:
+            UI_FONT = candidate
+            break
+
+# --- стили ttk ---
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except tk.TclError:
+    pass
+
+style.configure("TButton",
+                font=(UI_FONT, 10),
+                padding=(10, 5),
+                borderwidth=0,
+                background=COLORS["panel"],
+                foreground=COLORS["text_fg"])
+style.map("TButton",
+          background=[("active", COLORS["accent_hov"])],
+          foreground=[("active", "white")])
+
+style.configure("TEntry",
+                font=(UI_FONT, 10),
+                padding=4,
+                fieldbackground=COLORS["panel"])
+
+style.configure("Treeview",
+                font=(UI_FONT, 10),
+                background=COLORS["panel"],
+                fieldbackground=COLORS["panel"],
+                rowheight=28,
+                borderwidth=0)
+style.map("Treeview",
+          background=[("selected", COLORS["accent_hov"])],
+          foreground=[("selected", "white")])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ВЕРХНЯЯ ПАНЕЛЬ (TOOLBAR)
+# ══════════════════════════════════════════════════════════════════════
+
+toolbar = tk.Frame(root, bg=COLORS["panel"], height=52)
+toolbar.pack(side=tk.TOP, fill=tk.X)
+toolbar.pack_propagate(False)
+tk.Frame(root, bg=COLORS["border"], height=1).pack(side=tk.TOP, fill=tk.X)
+
+# логотип
+tk.Label(toolbar, text="📖  Читалка",
+         font=(UI_FONT, 12, "bold"),
+         bg=COLORS["panel"], fg=COLORS["accent"]
+         ).pack(side=tk.LEFT, padx=(14, 20))
+
+# кнопки открытия / оглавления
+btn_open = ttk.Button(toolbar, text="📂  Открыть", command=lambda: open_file())
+btn_open.pack(side=tk.LEFT, padx=3, pady=8)
+
+btn_toc = ttk.Button(toolbar, text="☰  Оглавление", command=lambda: toggle_toc())
+btn_toc.pack(side=tk.LEFT, padx=3, pady=8)
+
+# разделитель
+ttk.Separator(toolbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=12)
+
+# поиск
+tk.Label(toolbar, text="Поиск:", bg=COLORS["panel"], fg=COLORS["text_fg"],
+         font=(UI_FONT, 10)).pack(side=tk.LEFT, padx=(0, 4))
+
+search_var = tk.StringVar()
+search_entry = ttk.Entry(toolbar, textvariable=search_var, width=22)
+search_entry.pack(side=tk.LEFT, padx=(0, 4), pady=8)
+search_entry.bind("<Return>", lambda e: find_text())
+
+ttk.Button(toolbar, text="🔍", width=3,
+           command=lambda: find_text()).pack(side=tk.LEFT, padx=2)
+ttk.Button(toolbar, text="→", width=3,
+           command=lambda: find_next()).pack(side=tk.LEFT, padx=2)
+ttk.Button(toolbar, text="✕", width=3,
+           command=lambda: clear_highlight()).pack(side=tk.LEFT, padx=2)
+
+# правая группа: переключатель режима и размер шрифта
+right_group = tk.Frame(toolbar, bg=COLORS["panel"])
+right_group.pack(side=tk.RIGHT, padx=10)
+
+ttk.Button(right_group, text="A+", width=4,
+           command=lambda: change_font(2)).pack(side=tk.RIGHT, padx=2)
+ttk.Button(right_group, text="A−", width=4,
+           command=lambda: change_font(-2)).pack(side=tk.RIGHT, padx=2)
+
+btn_mode = ttk.Button(right_group, text="📜  Скролл", width=12,
+                      command=lambda: toggle_mode())
+btn_mode.pack(side=tk.RIGHT, padx=6)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ЦЕНТРАЛЬНАЯ ЧАСТЬ: ОГЛАВЛЕНИЕ + ТЕКСТ
+# ══════════════════════════════════════════════════════════════════════
+
+main_area = tk.Frame(root, bg=COLORS["bg"])
+main_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+# --- панель оглавления (по умолчанию НЕ упакована) ---
+toc_frame = tk.Frame(main_area, bg=COLORS["panel"], width=270)
+toc_frame.pack_propagate(False)
+
+toc_header = tk.Frame(toc_frame, bg=COLORS["panel"])
+toc_header.pack(side=tk.TOP, fill=tk.X, pady=(10, 4))
+tk.Label(toc_header, text="Оглавление",
+         font=(UI_FONT, 11, "bold"),
+         bg=COLORS["panel"], fg=COLORS["text_fg"]
+         ).pack(side=tk.LEFT, padx=12)
+
+toc_scroll = ttk.Scrollbar(toc_frame, orient="vertical")
+toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+toc_tree = ttk.Treeview(toc_frame, show="tree",
+                        selectmode="browse",
+                        yscrollcommand=toc_scroll.set)
+toc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=6)
+toc_scroll.config(command=toc_tree.yview)
+toc_tree.bind("<<TreeviewSelect>>", lambda e: on_toc_select())
+
+# разделительная линия между оглавлением и текстом (тоже не упакована)
+toc_sep = tk.Frame(main_area, bg=COLORS["border"], width=1)
+
+# --- текстовое поле (всегда упаковано) ---
+text_container = tk.Frame(main_area, bg=COLORS["bg"])
+text_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+# «поля» вокруг текста — чтобы страница «дышала»
+text_inner = tk.Frame(text_container, bg=COLORS["text_bg"])
+text_inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
+
+text_area = tk.Text(
+    text_inner,
+    wrap="word",
+    font=(READ_FONT, current_font_size),
+    bg=COLORS["text_bg"],
+    fg=COLORS["text_fg"],
+    insertbackground=COLORS["accent"],
+    selectbackground="#f0e0c0",
+    selectforeground=COLORS["text_fg"],
+    relief="flat", borderwidth=0,
+    padx=28, pady=20,
+    spacing1=2, spacing2=2, spacing3=6,
+    cursor="arrow",
+    state="disabled",       # текст книги недоступен для правки
+)
+text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+text_scrollbar = ttk.Scrollbar(text_inner, orient="vertical",
+                               command=text_area.yview)
+text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+text_area.configure(yscrollcommand=text_scrollbar.set)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  НИЖНЯЯ ПАНЕЛЬ (СТАТУС-БАР + навигация по страницам)
+# ══════════════════════════════════════════════════════════════════════
+
+tk.Frame(root, bg=COLORS["border"], height=1).pack(side=tk.BOTTOM, fill=tk.X)
+
+status_bar = tk.Frame(root, bg=COLORS["panel"], height=44)
+status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+status_bar.pack_propagate(False)
+
+# три «колонки»: слева статус, по центру — листание, справа — прогресс
+status_bar.grid_columnconfigure(0, weight=1)
+status_bar.grid_columnconfigure(2, weight=1)
+
+status_label = tk.Label(status_bar, text="Готово",
+                        bg=COLORS["panel"], fg=COLORS["muted"],
+                        font=(UI_FONT, 9), anchor="w")
+status_label.grid(row=0, column=0, sticky="w", padx=14, pady=10)
+
+# контейнер с кнопками листания (по умолчанию НЕ упакован — только для page-режима)
+page_controls = tk.Frame(status_bar, bg=COLORS["panel"])
+
+btn_prev_page = ttk.Button(page_controls, text="◀  Назад", width=12,
+                           command=lambda: turn_page(-1))
+btn_prev_page.pack(side=tk.LEFT, padx=4)
+
+page_indicator = tk.Label(page_controls, text="— / —",
+                          bg=COLORS["panel"], fg=COLORS["text_fg"],
+                          font=(UI_FONT, 10, "bold"), width=12)
+page_indicator.pack(side=tk.LEFT, padx=6)
+
+btn_next_page = ttk.Button(page_controls, text="Вперёд  ▶", width=12,
+                           command=lambda: turn_page(1))
+btn_next_page.pack(side=tk.LEFT, padx=4)
+
+progress_label = tk.Label(status_bar, text="0%",
+                          bg=COLORS["panel"], fg=COLORS["muted"],
+                          font=(UI_FONT, 9), anchor="e")
+progress_label.grid(row=0, column=2, sticky="e", padx=14, pady=10)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ТЕГИ (СТИЛИ) ДЛЯ ТЕКСТА КНИГИ
+# ══════════════════════════════════════════════════════════════════════
+
+def config_text_tags():
+    """Перенастраивает теги под текущий размер шрифта."""
+    fs = current_font_size
+    text_area.tag_config("h1",
+        font=(READ_FONT, fs + 8, "bold"),
+        foreground="#3b2d1a",
+        spacing1=22, spacing3=12, justify="center")
+    text_area.tag_config("h2",
+        font=(READ_FONT, fs + 5, "bold"),
+        foreground="#3b2d1a",
+        spacing1=18, spacing3=8)
+    text_area.tag_config("h3",
+        font=(READ_FONT, fs + 3, "bold"),
+        foreground="#4a3a22",
+        spacing1=14, spacing3=6)
+    text_area.tag_config("h4",
+        font=(READ_FONT, fs + 1, "bold"),
+        foreground="#4a3a22",
+        spacing1=10, spacing3=5)
+
+    text_area.tag_config("highlight", background="#fff3a0", foreground="#000000")
+    text_area.tag_config("current",   background="#ffb84d", foreground="#000000")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ОТКРЫТИЕ И ЗАГРУЗКА КНИГИ
+# ══════════════════════════════════════════════════════════════════════
+
+def set_text_content(content):
+    """Заменяет содержимое текстового поля (учитывает state=disabled)."""
+    text_area.configure(state="normal")
+    text_area.delete("1.0", tk.END)
+    text_area.insert("1.0", content)
+    text_area.configure(state="disabled")
+
+
+def open_file():
+    """Диалог выбора файла и загрузка книги."""
+    path = filedialog.askopenfilename(
+        title="Открыть книгу",
         filetypes=[
             ("Все поддерживаемые", "*.txt *.fb2 *.epub *.pdf"),
             ("Текстовые файлы", "*.txt"),
-            ("Книги FB2", "*.fb2"),
+            ("Книги FB2",  "*.fb2"),
             ("Книги EPUB", "*.epub"),
             ("Документы PDF", "*.pdf"),
-        ]
+            ("Все файлы", "*.*"),
+        ],
     )
-    if file_path:  # если пользователь выбрал файл
-        if load_book(file_path):
-            # Сохраняем настройки (позиция будет сохранена позже при скролле)
-            save_settings(file_path, 0.0, current_font_size)
-
-
-# === СОХРАНЕНИЕ ПОЗИЦИИ ===
-def save_scroll_position(event=None):
-    """Сохраняет позицию прокрутки и размер шрифта"""
-    if hasattr(text_area, 'last_file') and text_area.last_file:
-        scroll_pos = text_area.yview()[0]
-        save_settings(text_area.last_file, scroll_pos, current_font_size)
-
-
-def on_closing():
-    """Сохраняет настройки при закрытии"""
-    if hasattr(text_area, 'last_file') and text_area.last_file:
-        scroll_pos = text_area.yview()[0]
-        save_settings(text_area.last_file, scroll_pos, current_font_size)
-    window.destroy()
-
-
-def increase_font():
-    """Увеличивает размер шрифта на 2 пункта"""
-    global current_font_size
-    current_font_size = min(current_font_size + 2, 40)  # Максимум 40
-    apply_font()
-    save_current_settings()
-
-
-def decrease_font():
-    """Уменьшает размер шрифта на 2 пункта"""
-    global current_font_size
-    current_font_size = max(current_font_size - 2, 8)  # Минимум 8
-    apply_font()
-    save_current_settings()
-
-
-def apply_font():
-    """Применяет текущий размер шрифта к текстовому полю"""
-    text_area.configure(font=("Arial", current_font_size))
-
-
-def save_current_settings():
-    """Сохраняет текущие настройки (вызывается при изменении шрифта)"""
-    file_path = getattr(text_area, 'last_file', '')
-    scroll_pos = text_area.yview()[0] if file_path else 0
-    save_settings(file_path, scroll_pos, current_font_size)
-
-
-def find_text(event=None):
-    """Ищет все совпадения и подсвечивает их"""
-    # Убираем старую подсветку
-    text_area.tag_remove("highlight", "1.0", tk.END)
-    text_area.tag_remove("current", "1.0", tk.END)
-
-    # Получаем текст для поиска
-    query = search_entry.get()
-    if not query:
+    if not path:
         return
-
-    # Начинаем поиск с начала текста
-    start_pos = "1.0"
-    count = 0
-
-    while True:
-        # Ищем следующее совпадение
-        pos = text_area.search(query, start_pos, stopindex=tk.END, nocase=True)
-        if not pos:
-            break  # Совпадений больше нет
-
-        # Определяем конец совпадения
-        end_pos = f"{pos}+{len(query)}c"
-
-        # Подсвечиваем
-        text_area.tag_add("highlight", pos, end_pos)
-        count += 1
-
-        # Продолжаем поиск с конца текущего совпадения
-        start_pos = end_pos
-
-    # Если что-то нашли — переходим к первому совпадению
-    if count > 0:
-        first_pos = text_area.search(query, "1.0", stopindex=tk.END, nocase=True)
-        if first_pos:
-            end_pos = f"{first_pos}+{len(query)}c"
-            text_area.tag_remove("current", "1.0", tk.END)
-            text_area.tag_add("current", first_pos, end_pos)
-            text_area.see(first_pos)
-            text_area.mark_set("found_pos", first_pos)
-
-        # Показываем количество найденных совпадений
-        window.title(f"Моя читалка - Найдено: {count}")
-    else:
-        window.title("Моя читалка - Ничего не найдено")
+    if load_book(path):
+        save_settings(last_file=path, scroll_position=0.0)
+        status_label.config(text=f"Открыто: {os.path.basename(path)}")
 
 
-def find_next(event=None):
-    """Переходит к следующему совпадению"""
-    query = search_entry.get()
-    if not query:
-        return
+def load_book(path, scroll_position=0.0):
+    """Загружает книгу в текстовое поле и заполняет оглавление."""
+    if not os.path.exists(path):
+        return False
 
-    # Получаем позицию последнего найденного совпадения
-    if not text_area.mark_names() or "found_pos" not in text_area.mark_names():
-        # Если поиск не запускался — запускаем
-        find_text()
-        return
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".txt":
+            content, toc, headings = read_txt(path)
+        elif ext == ".fb2":
+            content, toc, headings = read_fb2(path)
+        elif ext == ".epub":
+            content, toc, headings = read_epub(path)
+        elif ext == ".pdf":
+            content, toc, headings = read_pdf(path)
+        else:
+            messagebox.showwarning("Формат не поддерживается",
+                                   f"Файлы {ext} не поддерживаются.")
+            return False
+    except Exception as e:
+        messagebox.showerror("Ошибка загрузки", str(e))
+        return False
 
-    current_pos = text_area.index("found_pos")
-    # Ищем следующее совпадение после текущего
-    end_pos = f"{current_pos}+{len(query)}c"
-    next_pos = text_area.search(query, end_pos, stopindex=tk.END, nocase=True)
+    set_text_content(content)          # вставляем текст
+    apply_headings(headings)           # накладываем стили заголовков
+    text_area.last_file = path         # запоминаем путь
 
-    if not next_pos:
-        # Если дошли до конца — начинаем сначала
-        next_pos = text_area.search(query, "1.0", stopindex=tk.END, nocase=True)
-        if not next_pos:
-            return
+    populate_toc(toc)                  # заполняем оглавление
 
-    # Снимаем выделение с предыдущего и выделяем новое
-    end_pos = f"{next_pos}+{len(query)}c"
-    text_area.tag_remove("current", "1.0", tk.END)
-    text_area.tag_add("current", next_pos, end_pos)
-    text_area.see(next_pos)
-    text_area.mark_set("found_pos", next_pos)
+    if scroll_position > 0:
+        text_area.yview_moveto(scroll_position)
 
-
-def clear_highlight():
-    """Убирает всю подсветку"""
-    text_area.tag_remove("highlight", "1.0", tk.END)
-    text_area.tag_remove("current", "1.0", tk.END)
-    search_entry.delete(0, tk.END)  # Очищаем поле поиска
-
-    # Возвращаем обычный заголовок
-    if hasattr(text_area, 'last_file') and text_area.last_file:
-        window.title(f"Моя читалка - {os.path.basename(text_area.last_file)}")
-    else:
-        window.title("Моя читалка")
+    root.title(f"Моя читалка — {os.path.basename(path)}")
+    update_progress()
+    return True
 
 
-# === НОВОЕ: ОГЛАВЛЕНИЕ ===
+def apply_headings(headings):
+    """Накладывает теги h1..h4 на строки-заголовки."""
+    for tag in ("h1", "h2", "h3", "h4"):
+        text_area.tag_remove(tag, "1.0", tk.END)
+    for line_index, level in headings:
+        lvl = min(level, 3)
+        text_area.tag_add(f"h{lvl + 1}",
+                          f"{line_index + 1}.0",
+                          f"{line_index + 1}.end")
 
-def populate_toc(toc_entries):
-    """Заполняет дерево оглавления.
-    toc_entries — список кортежей (название, номер_строки, уровень)."""
-    # 1) Очищаем дерево
+
+# ══════════════════════════════════════════════════════════════════════
+#  ОГЛАВЛЕНИЕ
+# ══════════════════════════════════════════════════════════════════════
+
+def populate_toc(toc):
+    """Заполняет дерево оглавления из плоского списка."""
     for item in toc_tree.get_children():
         toc_tree.delete(item)
 
-    # 2) Строим иерархию.
-    # parents[level] = id родителя для элементов этого уровня.
-    # parents[0] = "" (корень дерева — пустая строка).
-    parents = [""]
-
-    for title, line, level in toc_entries:
-        # Если вернулись на более высокий уровень — подрезаем лишних «родителей»
+    parents = [""]  # parents[level] — id родителя для этого уровня
+    for title, line, level in toc:
+        # подрезаем лишних «родителей», если уровень понизился
         if len(parents) > level + 1:
             del parents[level + 1:]
-        # Добираем недостающие уровни (бывает в кривых FB2/EPUB)
+        # добираем недостающие уровни
         while len(parents) <= level:
             parents.append("")
 
         parent = parents[level]
-        # values=(line,) — кладём номер строки внутрь элемента дерева
-        item_id = toc_tree.insert(parent, 'end', text=title, values=(line,))
+        item_id = toc_tree.insert(parent, "end", text=title, values=(line,))
 
-        # Этот элемент становится родителем для следующего уровня
         if len(parents) > level + 1:
             parents[level + 1] = item_id
         else:
             parents.append(item_id)
 
 
-def on_toc_select(event=None):
-    """Вызывается при выборе элемента в оглавлении — переходим к главе."""
-    selected = toc_tree.selection()
-    if not selected:
+def on_toc_select():
+    """Переход к выбранной главе."""
+    sel = toc_tree.selection()
+    if not sel:
         return
-    values = toc_tree.item(selected[0], 'values')
+    values = toc_tree.item(sel[0], "values")
     if not values:
         return
-
     try:
-        line_number = int(values[0])
+        line = int(values[0])
     except (ValueError, IndexError):
         return
-
-    # -1 означает «это просто заголовок-папка, переходить некуда»
-    if line_number < 0:
+    if line < 0:   # это «папка» без своей позиции в тексте
         return
 
-    # Прокручиваем так, чтобы глава оказалась вверху окна
-    total_lines = int(text_area.index('end-1c').split('.')[0])
-    if total_lines > 0:
-        fraction = line_number / total_lines
-        text_area.yview_moveto(fraction)
-    text_area.see(f"{line_number + 1}.0")
-    text_area.mark_set(tk.INSERT, f"{line_number + 1}.0")
+    total = int(text_area.index("end-1c").split(".")[0])
+    if total > 0:
+        text_area.yview_moveto(line / total)
+    text_area.see(f"{line + 1}.0")
+    update_progress()
 
 
 def toggle_toc():
-    """Показывает/скрывает панель оглавления."""
+    """Скрывает/показывает панель оглавления."""
     global toc_visible
     if toc_visible:
         toc_frame.pack_forget()
+        toc_sep.pack_forget()
         toc_visible = False
-        btn_toc.config(text="☰ Оглавление")
+        btn_toc.configure(text="☰  Оглавление")
     else:
-        # before=text_area — вставляем панель ЛЕВЕЕ текстового поля
-        toc_frame.pack(side=tk.LEFT, fill=tk.Y, before=text_area)
+        # вставляем панель и разделитель ПЕРЕД text_container
+        toc_frame.pack(side=tk.LEFT, fill=tk.Y, before=text_container)
+        toc_sep.pack(side=tk.LEFT, fill=tk.Y, before=text_container)
         toc_visible = True
-        btn_toc.config(text="✕ Скрыть")
+        btn_toc.configure(text="✕  Скрыть")
+    save_settings(toc_visible=toc_visible)
 
 
-# === ГЛАВНОЕ ОКНО ===
-# Создаём главное окно
-window = tk.Tk()
-window.title("Моя читалка")
-window.geometry("600x400")  # ширина x высота
+# ══════════════════════════════════════════════════════════════════════
+#  РЕЖИМ ЧТЕНИЯ: СКРОЛЛ / ПОСТРАНИЧНО
+# ══════════════════════════════════════════════════════════════════════
 
-# === ВЕРХНЯЯ ПАНЕЛЬ ПОИСКА ===
-search_frame = tk.Frame(window)
-search_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+def toggle_mode():
+    """Переключает между скроллом и постраничным листанием."""
+    global reading_mode
+    if reading_mode == "scroll":
+        reading_mode = "page"
+        text_scrollbar.pack_forget()              # прячем полосу прокрутки
+        page_controls.grid(row=0, column=1)       # показываем кнопки листания
+        btn_mode.configure(text="📖  Страницы")
+    else:
+        reading_mode = "scroll"
+        text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        page_controls.grid_remove()
+        btn_mode.configure(text="📜  Скролл")
 
-# Метка "Поиск:"
-label_search = tk.Label(search_frame, text="Поиск:")
-label_search.pack(side=tk.LEFT, padx=5)
+    save_settings(reading_mode=reading_mode)
+    update_progress()
 
-# Поле ввода для поиска
-search_entry = tk.Entry(search_frame, width=30)
-search_entry.pack(side=tk.LEFT, padx=5)
 
-# Кнопка "Найти"
-btn_find = tk.Button(search_frame, text="Найти", command=find_text, width=8)
-btn_find.pack(side=tk.LEFT, padx=5)
+def turn_page(direction):
+    """Перелистывает на одну страницу (1 — вперёд, -1 — назад)."""
+    text_area.yview_scroll(direction, "page")
+    update_progress()
 
-# Кнопка "Найти далее"
-btn_find_next = tk.Button(search_frame, text="Далее", command=find_next, width=8)
-btn_find_next.pack(side=tk.LEFT, padx=5)
 
-# Кнопка "Очистить"
-btn_clear = tk.Button(search_frame, text="Очистить", command=clear_highlight, width=8)
-btn_clear.pack(side=tk.LEFT, padx=5)
+# ══════════════════════════════════════════════════════════════════════
+#  ПОИСК С ПОДСВЕТКОЙ
+# ══════════════════════════════════════════════════════════════════════
 
-# Нижняя панель с кнопками
-bottom_frame = tk.Frame(window)
-bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+def find_text():
+    """Ищет все совпадения и подсвечивает их жёлтым, первое — оранжевым."""
+    text_area.tag_remove("highlight", "1.0", tk.END)
+    text_area.tag_remove("current", "1.0", tk.END)
 
-# Кнопка "Открыть файл" слева
-btn_open = tk.Button(bottom_frame, text="Открыть файл", command=open_file)
-btn_open.pack(side=tk.LEFT, padx=10)
+    query = search_var.get().strip()
+    if not query:
+        status_label.config(text="Введите текст для поиска")
+        return
 
-# === НОВОЕ: кнопка переключения оглавления ===
-btn_toc = tk.Button(bottom_frame, text="☰ Оглавление", command=toggle_toc, width=14)
-btn_toc.pack(side=tk.LEFT, padx=10)
+    start, count, first = "1.0", 0, None
+    while True:
+        pos = text_area.search(query, start, stopindex=tk.END, nocase=True)
+        if not pos:
+            break
+        end = f"{pos}+{len(query)}c"
+        text_area.tag_add("highlight", pos, end)
+        if first is None:
+            first = (pos, end)
+        count += 1
+        start = end
 
-# Кнопки изменения шрифта справа
-btn_font_minus = tk.Button(bottom_frame, text="A−", command=decrease_font, width=4)
-btn_font_minus.pack(side=tk.RIGHT, padx=5)
+    if count:
+        text_area.tag_add("current", *first)
+        text_area.see(first[0])
+        text_area.mark_set("found_pos", first[0])
+        status_label.config(text=f"Найдено: {count}")
+    else:
+        status_label.config(text="Ничего не найдено")
 
-btn_font_plus = tk.Button(bottom_frame, text="A+", command=increase_font, width=4)
-btn_font_plus.pack(side=tk.RIGHT, padx=5)
 
-# === НОВОЕ: контейнер, внутри которого будут оглавление (слева) и текст ===
-content_frame = tk.Frame(window)
-content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+def find_next():
+    """Переходит к следующему совпадению (циклически)."""
+    query = search_var.get().strip()
+    if not query:
+        return
+    if "found_pos" not in text_area.mark_names():
+        find_text()
+        return
 
-# --- Панель оглавления (сначала скрыта) ---
-toc_frame = tk.Frame(content_frame, bg="#f0f0f0")
+    current = text_area.index("found_pos")
+    end_current = f"{current}+{len(query)}c"
+    nxt = text_area.search(query, end_current, stopindex=tk.END, nocase=True)
+    if not nxt:   # дошли до конца — начинаем с начала
+        nxt = text_area.search(query, "1.0", stopindex=tk.END, nocase=True)
+    if not nxt:
+        return
 
-toc_label = tk.Label(toc_frame, text="Оглавление",
-                     font=("Arial", 11, "bold"), bg="#f0f0f0")
-toc_label.pack(side=tk.TOP, fill=tk.X, pady=5)
+    end = f"{nxt}+{len(query)}c"
+    text_area.tag_remove("current", "1.0", tk.END)
+    text_area.tag_add("current", nxt, end)
+    text_area.see(nxt)
+    text_area.mark_set("found_pos", nxt)
 
-# Вертикальная прокрутка для дерева
-toc_scroll = tk.Scrollbar(toc_frame, orient="vertical")
-toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-# Само дерево оглавления
-toc_tree = ttk.Treeview(toc_frame, show='tree', selectmode='browse',
-                        yscrollcommand=toc_scroll.set, height=30)
-toc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-toc_scroll.config(command=toc_tree.yview)
+def clear_highlight():
+    """Снимает всю подсветку и очищает поле поиска."""
+    text_area.tag_remove("highlight", "1.0", tk.END)
+    text_area.tag_remove("current", "1.0", tk.END)
+    search_var.set("")
+    status_label.config(text="Готово")
 
-# Клик по элементу дерева — переход к главе
-toc_tree.bind('<<TreeviewSelect>>', on_toc_select)
 
-# --- Текстовое поле ---
-text_area = scrolledtext.ScrolledText(content_frame, wrap=tk.WORD, font=("Arial", current_font_size))
-text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+# ══════════════════════════════════════════════════════════════════════
+#  РАЗМЕР ШРИФТА
+# ══════════════════════════════════════════════════════════════════════
 
-# Привязываем событие прокрутки к текстовому полю
-text_area.bind("<Configure>", save_scroll_position)
+def change_font(delta):
+    """Меняет размер шрифта в пределах 8..40."""
+    global current_font_size
+    current_font_size = max(8, min(40, current_font_size + delta))
+    apply_font()
+    save_current_settings()
 
-# Привязываем событие прокрутки к текстовому полю
-text_area.bind("<Configure>", save_scroll_position)
 
-# Настраиваем тег для подсветки найденных слов
-text_area.tag_config("highlight", background="yellow", foreground="black")
-text_area.tag_config("current", background="orange", foreground="black")
+def apply_font():
+    """Применяет текущий размер шрифта и обновляет теги."""
+    text_area.configure(font=(READ_FONT, current_font_size))
+    config_text_tags()
+    update_progress()
 
-# Привязываем обработчик к крестику окна
-window.protocol("WM_DELETE_WINDOW", on_closing)
 
-# === АВТОМАТИЧЕСКАЯ ЗАГРУЗКА ПОСЛЕДНЕГО ФАЙЛА ===
-settings = load_settings()
-last_file = settings["last_file"]
-scroll_position = settings["scroll_position"]
-saved_font_size = settings["font_size"]
+# ══════════════════════════════════════════════════════════════════════
+#  ПРОГРЕСС И СОХРАНЕНИЕ ПОЗИЦИИ
+# ══════════════════════════════════════════════════════════════════════
 
-current_font_size = saved_font_size  # Применяем сохранённый размер
+def update_progress(event=None):
+    """Обновляет индикатор прогресса и (в page-режиме) номер страницы."""
+    try:
+        top, bottom = text_area.yview()
+    except tk.TclError:
+        return
+
+    percent = int(bottom * 100) if bottom >= 1.0 else int(top * 100)
+    progress_label.config(text=f"{percent}%")
+
+    if reading_mode == "page":
+        total_lines = int(text_area.index("end-1c").split(".")[0])
+        visible = max(1, int((bottom - top) * total_lines))
+        total_pages = max(1, round(total_lines / visible))
+        current_page = min(total_pages,
+                           int(top * total_lines / visible) + 1)
+        page_indicator.config(text=f"{current_page} / {total_pages}")
+
+
+def save_current_settings():
+    """Сохраняет текущее состояние (файл, позиция, шрифт, режим)."""
+    path = getattr(text_area, "last_file", "")
+    pos = text_area.yview()[0] if path else 0
+    save_settings(
+        last_file=path,
+        scroll_position=pos,
+        font_size=current_font_size,
+        reading_mode=reading_mode,
+        toc_visible=toc_visible,
+    )
+
+
+def on_closing():
+    """Сохранение при закрытии окна."""
+    save_settings(geometry=root.geometry())
+    save_current_settings()
+    root.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  КОПИРОВАНИЕ ВЫДЕЛЕННОГО (disabled-Text сам не копирует)
+# ══════════════════════════════════════════════════════════════════════
+
+def copy_selection(event=None):
+    try:
+        sel = text_area.get(tk.SEL_FIRST, tk.SEL_LAST)
+        root.clipboard_clear()
+        root.clipboard_append(sel)
+    except tk.TclError:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ГОРЯЧИЕ КЛАВИШИ
+# ══════════════════════════════════════════════════════════════════════
+
+root.bind("<Control-o>",     lambda e: open_file())
+root.bind("<Control-f>",     lambda e: search_entry.focus_set())
+root.bind("<Control-t>",     lambda e: toggle_toc())
+root.bind("<Control-plus>",  lambda e: change_font(2))
+root.bind("<Control-equal>", lambda e: change_font(2))   # та же клавиша без Shift
+root.bind("<Control-minus>", lambda e: change_font(-2))
+root.bind("<Control-c>",     copy_selection)
+root.bind("<F3>",            lambda e: find_next())
+root.bind("<Escape>",        lambda e: (clear_highlight(), text_area.focus_set()))
+
+# листание стрелками/PageUp/PageDown — только в page-режиме
+root.bind("<Next>",  lambda e: turn_page(1)  if reading_mode == "page" else None)
+root.bind("<Prior>", lambda e: turn_page(-1) if reading_mode == "page" else None)
+root.bind("<Right>", lambda e: turn_page(1)  if reading_mode == "page" else None)
+root.bind("<Left>",  lambda e: turn_page(-1) if reading_mode == "page" else None)
+
+# обновляем прогресс при скролле / изменении размера
+for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>",
+            "<KeyRelease>", "<Configure>"):
+    text_area.bind(seq, lambda e: root.after(30, update_progress))
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ЗАПУСК ПРИЛОЖЕНИЯ
+# ══════════════════════════════════════════════════════════════════════
+
+# применяем базовые теги и шрифт
+config_text_tags()
+
+# загружаем сохранённые настройки
+_s = load_settings()
+current_font_size = _s.get("font_size", 16)
+reading_mode      = "scroll"                 # сначала выставим значение по умолчанию
+root.geometry(_s.get("geometry", "1000x700"))
+
 apply_font()
 
-if last_file and os.path.exists(last_file):
-    load_book(last_file, scroll_position)
+# включаем нужный режим (если был сохранён page — переключаемся)
+if _s.get("reading_mode") == "page":
+    toggle_mode()
 
-# Горячие клавиши
-window.bind("<Control-f>", lambda e: search_entry.focus_set())  # Ctrl+F — фокус на поиск
-window.bind("<Return>", find_next)                              # Enter — найти далее
-window.bind("<Escape>", lambda e: clear_highlight())            # Escape — очистить
-window.bind("<Control-o>", lambda e: open_file())               # Ctrl+O — открыть новый файл
+# показываем оглавление, если было открыто
+if _s.get("toc_visible"):
+    toggle_toc()
 
-# === ЗАПУСК ===
-# Запускаем главный цикл окна
-window.mainloop()
+# автозагрузка последней книги
+_last = _s.get("last_file", "")
+if _last and os.path.exists(_last):
+    if load_book(_last, _s.get("scroll_position", 0.0)):
+        status_label.config(text=f"Продолжаем: {os.path.basename(_last)}")
+else:
+    # приветственное сообщение
+    welcome = (
+        "\n\n"
+        "        📖   Добро пожаловать в читалку!\n\n"
+        "        Ctrl+O — открыть книгу\n"
+        "        Ctrl+F — поиск\n"
+        "        Ctrl+T — оглавление\n"
+        "        Ctrl + / Ctrl − — размер шрифта\n"
+        "        Стрелки / PageUp / PageDown — листание в режиме страниц\n\n"
+        "        Поддерживаются форматы: TXT, FB2, EPUB, PDF"
+    )
+    set_text_content(welcome)
+    text_area.tag_add("h1", "3.0", "3.end")
 
-
+root.mainloop()
